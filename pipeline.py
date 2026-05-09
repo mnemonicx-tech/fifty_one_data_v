@@ -449,6 +449,78 @@ def fetch_s3_subset(cfg: Dict[str, Any]) -> Dict:
 
     Returns the subset COCO dict.
     """
+    local_ann = cfg.get("local_annotations_json")
+    local_img_dir = cfg.get("local_images_dir")
+
+    # Local mode: sample from a local COCO file and reuse local images directly.
+    if local_ann and local_img_dir:
+        ann_local_path = Path(local_ann)
+        if not ann_local_path.exists():
+            raise FileNotFoundError(f"Local annotations file not found: {ann_local_path}")
+
+        images_root = Path(local_img_dir)
+        if not images_root.exists():
+            raise FileNotFoundError(f"Local images directory not found: {images_root}")
+
+        use_streaming = bool(cfg.get("stream_annotations", True))
+        coco = None
+        all_ids: List[int] = []
+
+        if use_streaming and cfg["sampling_mode"] in {"random", "metrics"}:
+            try:
+                all_ids = _stream_image_ids(ann_local_path)
+                log.info("Discovered %d image IDs via streaming parser (local).", len(all_ids))
+            except ModuleNotFoundError:
+                if cfg.get("allow_full_load_fallback", False):
+                    log.warning("ijson is not installed; falling back to full in-memory JSON load.")
+                    with open(ann_local_path) as f:
+                        coco = json.load(f)
+                    all_ids = [img["id"] for img in coco["images"]]
+                else:
+                    raise RuntimeError(
+                        "ijson is required for low-memory streaming mode. "
+                        f"Install it in this interpreter: {sys.executable} -m pip install ijson"
+                    )
+        else:
+            with open(ann_local_path) as f:
+                coco = json.load(f)
+            all_ids = [img["id"] for img in coco["images"]]
+
+        n = cfg["sample_size"]
+        mode = cfg["sampling_mode"]
+        seed = cfg["random_seed"]
+
+        log.info("Sampling mode: %s | target: %d images", mode, n)
+
+        if mode == "random":
+            selected_ids = _sample_random(all_ids, n, seed)
+        elif mode == "stratified":
+            if coco is None:
+                with open(ann_local_path) as f:
+                    coco = json.load(f)
+            selected_ids = _sample_stratified(coco, n, seed)
+        elif mode == "metrics":
+            selected_ids = _sample_by_metrics(all_ids, n, cfg.get("metrics_json"), seed)
+        else:
+            raise ValueError(f"Unknown sampling_mode: {mode!r}")
+
+        if coco is None:
+            subset = _build_coco_subset_streaming(ann_local_path, selected_ids)
+        else:
+            subset = _build_coco_subset(coco, selected_ids)
+
+        ann_path = cfg["annotations_path"]
+        os.makedirs(Path(ann_path).parent, exist_ok=True)
+        disk_subset = {k: v for k, v in subset.items() if not k.startswith("_")}
+        with open(ann_path, "w") as f:
+            json.dump(disk_subset, f, default=_json_default_encoder)
+        log.info("Subset annotations written to %s", ann_path)
+
+        # Ensure downstream loader points to the provided local images.
+        cfg["images_dir"] = str(images_root)
+        log.info("Local mode enabled: skipping S3 image download.")
+        return subset
+
     s3 = _get_s3_client(cfg)
     use_streaming = bool(cfg.get("stream_annotations", True))
     coco = None
@@ -1020,6 +1092,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Random seed")
     p.add_argument("--aws-profile",      default=None,
                    help="AWS named profile (optional)")
+    p.add_argument("--local-images-dir", default=None,
+                   help="Local images directory (enables local mode with --local-annotations-json)")
+    p.add_argument("--local-annotations-json", default=None,
+                   help="Local COCO annotations JSON path (enables local mode with --local-images-dir)")
     p.add_argument("--no-stream-annotations", action="store_true",
                    help="Disable low-memory streaming parser for annotations")
     p.add_argument("--annotation-cache-dir", default=None,
@@ -1051,6 +1127,8 @@ def _args_to_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "download_workers":   args.workers,
         "random_seed":        args.seed,
         "aws_profile":        args.aws_profile,
+        "local_images_dir":   args.local_images_dir,
+        "local_annotations_json": args.local_annotations_json,
         "stream_annotations": not args.no_stream_annotations,
         "annotation_cache_dir": args.annotation_cache_dir,
         "allow_full_load_fallback": args.allow_full_load_fallback,
