@@ -1057,6 +1057,7 @@ def build_views(dataset: fo.Dataset) -> Dict[str, fo.DatasetView]:
 def launch_fiftyone_ui(
     dataset: fo.Dataset,
     views: Dict[str, fo.DatasetView],
+    host: str = "0.0.0.0",
     port: int = 5151,
 ) -> fo.Session:
     """
@@ -1066,16 +1067,17 @@ def launch_fiftyone_ui(
 
     The session is returned so the caller can keep it alive.
     """
-    log.info("Launching FiftyOne App on port %d …", port)
+    log.info("Launching FiftyOne App on %s:%d …", host, port)
 
     session = fo.launch_app(
         dataset=dataset,
+        address=host,
         port=port,
         remote=True,   # remote=True → prints URL even in headless/SSH envs
         auto=False,    # don't try to open a browser automatically
     )
 
-    url = f"http://localhost:{port}"
+    url = f"http://{host}:{port}"
     print("\n" + "=" * 60)
     print(f"  FiftyOne App running at: {url}")
     print("=" * 60)
@@ -1124,7 +1126,12 @@ def run_pipeline(cfg: Dict[str, Any]) -> fo.Session:
 
     # ── 6. Launch UI ─────────────────────────────────────────────────────────
     log.info("━━ Step 6: Launch FiftyOne UI ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    session = launch_fiftyone_ui(dataset, views, port=cfg.get("port", 5151))
+    session = launch_fiftyone_ui(
+        dataset,
+        views,
+        host=cfg.get("host", "0.0.0.0"),
+        port=cfg.get("port", 5151),
+    )
 
     elapsed = time.perf_counter() - t0
     log.info("Pipeline completed in %.1f s.", elapsed)
@@ -1165,6 +1172,8 @@ def _parse_args() -> argparse.Namespace:
                    help="FiftyOne dataset name")
     p.add_argument("--port",             type=int, default=5151,
                    help="FiftyOne App port")
+    p.add_argument("--host",             default="0.0.0.0",
+                   help="FiftyOne bind host (use 0.0.0.0 for remote VM access)")
     p.add_argument("--workers",          type=int, default=DEFAULT_CONFIG["download_workers"],
                    help="Parallel S3 download workers")
     p.add_argument("--seed",             type=int, default=DEFAULT_CONFIG["random_seed"],
@@ -1203,6 +1212,7 @@ def _args_to_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "images_dir":         str(Path(root) / "images"),
         "annotations_path":   str(Path(root) / "annotations.json"),
         "dataset_name":       args.dataset_name,
+        "host":               args.host,
         "port":               args.port,
         "download_workers":   args.workers,
         "random_seed":        args.seed,
