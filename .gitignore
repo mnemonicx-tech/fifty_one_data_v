@@ -1,0 +1,7 @@
+.venv/
+/subset_m1_8gb/**/*
+/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
