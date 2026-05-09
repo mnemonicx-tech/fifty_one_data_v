@@ -100,6 +100,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ── Sampling ────────────────────────────────────────────────────────────
     "sample_size": 3_000,
     "sampling_mode": "random",                    # "random" | "stratified" | "metrics"
+    "use_full_dataset": False,                    # True -> skip sampling and use full local dataset
     "metrics_json": None,                         # path to precomputed metrics JSON
     "random_seed": 42,
     # ── Local paths ─────────────────────────────────────────────────────────
@@ -254,6 +255,51 @@ def _json_default_encoder(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return float(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
+def _resolve_local_data_path(images_dir: str, ann_path: str) -> str:
+    """
+    Resolve the effective local data_path for COCO import.
+
+    Some datasets store files under images/train or images/val while annotation
+    file_name entries are relative to those subfolders.
+    """
+    root = Path(images_dir)
+    if not root.exists() or not Path(ann_path).exists():
+        return images_dir
+
+    try:
+        with open(ann_path) as f:
+            ann = json.load(f)
+    except Exception:
+        return images_dir
+
+    filenames = [img.get("file_name") for img in ann.get("images", []) if img.get("file_name")]
+    if not filenames:
+        return images_dir
+
+    # Sample a handful of paths for a fast and robust check.
+    sample = filenames[: min(25, len(filenames))]
+    candidates = [
+        root,
+        root / "train",
+        root / "val",
+        root / "validation",
+        root / "test",
+    ]
+
+    best = root
+    best_hits = -1
+    for c in candidates:
+        hits = sum(1 for fn in sample if (c / fn).exists())
+        if hits > best_hits:
+            best_hits = hits
+            best = c
+
+    if best_hits > 0 and best != root:
+        log.info("Adjusted local data_path to %s based on annotation file_name paths.", best)
+
+    return str(best)
 
 
 def _safe_sample_field(sample: fo.Sample, field_name: str, default: Any = None) -> Any:
@@ -451,9 +497,36 @@ def fetch_s3_subset(cfg: Dict[str, Any]) -> Dict:
     """
     local_ann = cfg.get("local_annotations_json")
     local_img_dir = cfg.get("local_images_dir")
+    full_dataset = bool(cfg.get("use_full_dataset", False))
+
+    if full_dataset:
+        if not (local_ann and local_img_dir):
+            raise ValueError(
+                "--full-dataset requires local dataset paths. Provide both "
+                "--local-images-dir and --local-annotations-json"
+            )
+
+        ann_local_path = Path(local_ann)
+        images_root = Path(local_img_dir)
+        if not ann_local_path.exists():
+            raise FileNotFoundError(f"Local annotations file not found: {ann_local_path}")
+        if not images_root.exists():
+            raise FileNotFoundError(f"Local images directory not found: {images_root}")
+
+        cfg["annotations_path"] = str(ann_local_path)
+        cfg["images_dir"] = str(images_root)
+
+        log.info("Full-dataset mode enabled: sampling skipped.")
+        log.info("  local_annotations_json=%s", cfg["annotations_path"])
+        log.info("  local_images_dir=%s", cfg["images_dir"])
+        return {}
 
     # Local mode: sample from a local COCO file and reuse local images directly.
     if local_ann and local_img_dir:
+        log.info("Local mode detected: using local annotations and local images (no S3 downloads).")
+        log.info("  local_annotations_json=%s", local_ann)
+        log.info("  local_images_dir=%s", local_img_dir)
+
         ann_local_path = Path(local_ann)
         if not ann_local_path.exists():
             raise FileNotFoundError(f"Local annotations file not found: {ann_local_path}")
@@ -606,6 +679,10 @@ def load_fiftyone_dataset(cfg: Dict[str, Any]) -> fo.Dataset:
     name = cfg["dataset_name"]
     ann_path = cfg["annotations_path"]
     images_dir = cfg["images_dir"]
+
+    if cfg.get("local_annotations_json") and cfg.get("local_images_dir"):
+        images_dir = _resolve_local_data_path(images_dir, ann_path)
+        cfg["images_dir"] = images_dir
 
     # Delete existing dataset with the same name if requested
     if cfg.get("overwrite_dataset") and fo.dataset_exists(name):
@@ -1021,7 +1098,7 @@ def run_pipeline(cfg: Dict[str, Any]) -> fo.Session:
     t0 = time.perf_counter()
 
     # ── 1. Fetch subset from S3 ──────────────────────────────────────────────
-    log.info("━━ Step 1: S3 Subset Sampling ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log.info("━━ Step 1: Subset Sampling (S3 or Local) ━━━━━━━━━━━━━━━━━━━")
     fetch_s3_subset(cfg)
 
     # ── 2. Load into FiftyOne ────────────────────────────────────────────────
@@ -1074,6 +1151,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mode",             choices=["random", "stratified", "metrics"],
                    default=DEFAULT_CONFIG["sampling_mode"],
                    help="Sampling strategy")
+    p.add_argument("--full-dataset",     action="store_true",
+                   help="Load full local dataset without subset sampling")
     p.add_argument("--metrics-json",     default=None,
                    help="Path to precomputed metrics JSON")
     p.add_argument("--predictions-json", default=None,
@@ -1116,6 +1195,7 @@ def _args_to_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "s3_annotations_key": args.annotations_key,
         "sample_size":        args.sample_size,
         "sampling_mode":      args.mode,
+        "use_full_dataset":   args.full_dataset,
         "metrics_json":       args.metrics_json,
         "predictions_json":   args.predictions_json,
         "fp_bleed_threshold": args.fp_bleed_threshold,
